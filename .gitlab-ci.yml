@@ -1,0 +1,368 @@
+default:
+  image: "archlinux/archlinux:latest"
+
+stages:
+  - cleanup
+  - lint
+  - rootfs
+  - image
+  - test
+  - pre-release
+  - release
+  - publish
+
+cleanup:
+  stage: cleanup
+  tags:
+    - secure
+    - docker
+  only:
+    refs:
+      - schedules@archlinux/archlinux-docker
+    variables:
+      - $CLEANUP_PACKAGE_REGISTRY == "TRUE"
+  before_script:
+    - pacman -Syu --noconfirm jq
+  script:
+    - |
+      for id in $(curl --silent --fail --show-error "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages?per_page=100&order_by=created_at&sort=asc" | jq '.[] | select(.created_at | split("T")[0] | . < (now-60*60*24*60|strflocaltime("%Y-%m-%d"))) | .id'); do
+        curl --silent --fail --show-error --request DELETE --header "PRIVATE-TOKEN: ${GITLAB_PROJECT_TOKEN}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/${id}"
+      done
+
+lint:
+  stage: lint
+  image: hadolint/hadolint:latest-alpine
+  # DL3018: We don't need apk version pins, we use the bleeding edge
+  script: hadolint --ignore DL3018 Dockerfile.template
+  except:
+    - releases
+    - tags
+
+# This is an implicit gitlab stage, with the build.env variables used by either
+# other stages or auxiliarry scripts.
+get_version:
+  stage: .pre
+  script:
+    - |
+      # If we're building a tagged release, use the tag (without the 'v' prefix) as the
+      # BUILD_VERSION. Otherwise, determine a new BUILD_VERSION.
+      if [[ -n "$CI_COMMIT_TAG" ]]; then
+        echo "BUILD_VERSION=${CI_COMMIT_TAG/v/}" > build.env
+      else
+        echo "BUILD_VERSION=$(date +%Y%m%d).0.$CI_JOB_ID" > build.env
+      fi
+    - export $(< build.env)
+    - echo "PACKAGE_REGISTRY_URL=${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rootfs/${BUILD_VERSION}" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+.rootfs:
+  stage: rootfs
+  parallel:
+    matrix:
+      - GROUP: [base, base-devel, multilib-devel]
+  before_script:
+    - pacman -Syu --noconfirm git make fakechroot fakeroot
+    - pacman -Sdd --noconfirm devtools
+  script:
+    - make $PWD/output/Dockerfile.$GROUP
+  artifacts:
+    paths:
+      - output/*
+    exclude:
+      - output/*.tar
+    expire_in: 2h
+
+rootfs:
+  extends: .rootfs
+  except:
+    - master@archlinux/archlinux-docker
+    - releases@archlinux/archlinux-docker
+    - schedules@archlinux/archlinux-docker
+    - tags@archlinux/archlinux-docker
+
+rootfs:secure:
+  extends: .rootfs
+  tags:
+    - secure
+    - docker
+  only:
+    - master@archlinux/archlinux-docker
+    - schedules@archlinux/archlinux-docker
+  except:
+    - tags
+    - releases
+
+.image:
+  stage: image
+  parallel:
+    matrix:
+      - GROUP: [base, base-devel, multilib-devel]
+  tags:
+    - vm
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - podman build
+        -f "$CI_PROJECT_DIR/output/Dockerfile.$GROUP"
+        -t "$CI_REGISTRY_IMAGE:$GROUP-$CI_COMMIT_REF_SLUG"
+        "$CI_PROJECT_DIR/output"
+    - podman push --sign-by-sigstore=<(sed "s/TEMPLATE_OIDC_ID_TOKEN/${SIGSTORE_ID_TOKEN}/" sigstore-param-file.yaml) "$CI_REGISTRY_IMAGE:$GROUP-$CI_COMMIT_REF_SLUG"
+
+image:build:
+  extends: .image
+  except:
+    - master@archlinux/archlinux-docker
+    - releases
+    - schedules@archlinux/archlinux-docker
+    - tags
+  before_script:
+    - pacman -Syu --noconfirm podman
+    - podman login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - 'echo -e "default-docker:\n  use-sigstore-attachments: true" > /etc/containers/registries.d/sigstore.yaml'
+
+image:build:secure:
+  extends: .image
+  tags:
+    - secure
+    - vm
+  only:
+    - master@archlinux/archlinux-docker
+    - schedules@archlinux/archlinux-docker
+  except:
+    - tags
+  before_script:
+    - pacman -Syu --noconfirm podman
+    - podman login -u "$GITLAB_PROJECT_USER" -p "$GITLAB_PROJECT_TOKEN" "$CI_REGISTRY"
+    - 'echo -e "default-docker:\n  use-sigstore-attachments: true" > /etc/containers/registries.d/sigstore.yaml'
+
+# Build and publish to the Arch Linux group namespaces:
+# https://hub.docker.com/r/archlinux/archlinux
+# https://quay.io/repository/archlinux/archlinux
+image:publish:secure:
+  extends: .image
+  retry: 2
+  tags:
+    - secure
+    - vm
+  only:
+    - tags@archlinux/archlinux-docker
+  before_script:
+    - pacman -Syu --noconfirm podman
+    - podman login -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_ACCESS_TOKEN" "docker.io"
+    - podman login -u "$QUAY_USERNAME" -p "$QUAY_PASSWORD" "quay.io"
+    - podman login -u "$GHCR_USERNAME" -p "$GHCR_PASSWORD" "ghcr.io"
+    - 'echo -e "default-docker:\n  use-sigstore-attachments: true" > /etc/containers/registries.d/sigstore.yaml'
+  script:
+    - podman build
+        -f "$CI_PROJECT_DIR/Dockerfile.$GROUP"
+        -t "archlinux:$GROUP-$BUILD_VERSION"
+        "$CI_PROJECT_DIR"
+    - |
+      for host in "docker.io" "quay.io" "ghcr.io"; do
+        podman tag "archlinux:$GROUP-$BUILD_VERSION" "$host/archlinux/archlinux:$GROUP"
+        podman tag "archlinux:$GROUP-$BUILD_VERSION" "$host/archlinux/archlinux:$GROUP-$BUILD_VERSION"
+        podman push "$host/archlinux/archlinux:$GROUP"
+        podman push --sign-by-sigstore=<(sed "s/TEMPLATE_OIDC_ID_TOKEN/${SIGSTORE_ID_TOKEN}/" sigstore-param-file.yaml) "$host/archlinux/archlinux:$GROUP-$BUILD_VERSION"
+
+        if [[ "$GROUP" == "base" ]]; then
+          podman tag "archlinux:$GROUP-$BUILD_VERSION" "$host/archlinux/archlinux:latest"
+          podman push "$host/archlinux/archlinux:latest"
+        fi
+      done
+
+
+.test:
+  stage: test
+  dependencies: []
+  except:
+    refs:
+      - releases
+      - tags
+
+.test-script: &test-script
+  - test "$(cat /etc/group | wc -l)" -gt 10
+  - test "$(cat /etc/passwd | wc -l)" -gt 10
+  - pacman -Sy
+  - pacman -Qqk
+  - pacman -Syu --noconfirm podman grep
+  - podman -v
+  - id -u http
+  - locale | grep -q UTF-8
+
+test:base:
+  extends: .test
+  image: $CI_REGISTRY_IMAGE:base-$CI_COMMIT_REF_SLUG
+  script:
+    - *test-script
+
+test:base-devel:
+  extends: .test
+  image: $CI_REGISTRY_IMAGE:base-devel-$CI_COMMIT_REF_SLUG
+  script:
+    - *test-script
+    - gcc -v
+    - g++ -v
+    - make -v
+    - test -u /usr/bin/sudo   # issue 70
+    - test -u /usr/bin/passwd
+
+pre-release:
+  stage: pre-release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - secure
+    - docker
+  only:
+    refs:
+      - schedules@archlinux/archlinux-docker
+    variables:
+      - $PUBLISH_ARCHLINUX_REPOSITORY == "TRUE"
+      - $PUBLISH_OFFICIAL_LIBRARY == "TRUE"
+  before_script:
+    - apk update
+    - apk add jq curl httpie bash
+  script:
+    - |
+      echo "Update the description of our daily DockerHub repository at https://hub.docker.com/r/archlinux/archlinux"
+      TOKEN="$(http --ignore-stdin POST https://hub.docker.com/v2/users/login username="${DOCKERHUB_USERNAME}" password="${DOCKERHUB_PASSWORD}" | jq -er .token)"
+      http --ignore-stdin PATCH https://hub.docker.com/v2/repositories/archlinux/archlinux/ Authorization:"JWT ${TOKEN}" full_description="$(cat README.md)"
+
+      # Upload rootfs to the Generic Packages Repository
+      for group in base base-devel multilib-devel; do
+        rootfs_file="${group}-${BUILD_VERSION}.tar.zst"
+        mv "output/${group}.tar.zst" "output/${rootfs_file}"
+        mv "output/${group}.tar.zst.SHA256" "output/${rootfs_file}.SHA256"
+        sed -i "s|${group}.tar.zst|${rootfs_file}|" "output/${rootfs_file}.SHA256"
+        echo "Uploading ${rootfs_file}"
+        curl -sSf --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "output/${rootfs_file}" "${PACKAGE_REGISTRY_URL}/"
+        echo "Uploading ${rootfs_file}.SHA256"
+        curl -sSf --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "output/${rootfs_file}.SHA256" "${PACKAGE_REGISTRY_URL}/"
+      done
+
+      # Create the Dockerfiles, commit to the release branch
+      for group in base base-devel multilib-devel; do
+        rootfs_file="${group}-${BUILD_VERSION}.tar.zst"
+        ./scripts/make-dockerfile.sh "${rootfs_file}" "${group}" "output" "curl -sOJL \"${PACKAGE_REGISTRY_URL}/${rootfs_file}\"" "${group}"
+        sed -i "/^COPY ${rootfs_file} \/$/d" output/Dockerfile.${group}
+      done
+    - >
+      curl -sSf --request POST -o commit-response.json
+      --header "PRIVATE-TOKEN: ${GITLAB_PROJECT_TOKEN}"
+      --form "branch=releases"
+      --form "commit_message=Release ${BUILD_VERSION}"
+      --form "actions[][action]=update"
+      --form "actions[][file_path]=Dockerfile.base"
+      --form "actions[][content]=<output/Dockerfile.base"
+      --form "actions[][action]=update"
+      --form "actions[][file_path]=Dockerfile.base-devel"
+      --form "actions[][content]=<output/Dockerfile.base-devel"
+      --form "actions[][action]=update"
+      --form "actions[][file_path]=Dockerfile.multilib-devel"
+      --form "actions[][content]=<output/Dockerfile.multilib-devel"
+      --form "actions[][action]=update"
+      --form "actions[][file_path]=.gitlab-ci.yml"
+      --form "actions[][content]=<.gitlab-ci.yml"
+      --form "actions[][action]=update"
+      --form "actions[][file_path]=sigstore-param-file.yaml"
+      --form "actions[][content]=<sigstore-param-file.yaml"
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/commits"
+    - echo "BUILD_COMMIT=$(jq -r '.id' commit-response.json)" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+release:
+  stage: release
+  dependencies:
+    - get_version
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - secure
+    - docker
+  only:
+    refs:
+      - schedules@archlinux/archlinux-docker
+    variables:
+      - $PUBLISH_ARCHLINUX_REPOSITORY == "TRUE"
+      - $PUBLISH_OFFICIAL_LIBRARY == "TRUE"
+  script:
+    - echo 'Creating release'
+  release:
+    name: 'Release ${BUILD_VERSION}'
+    description: 'Release ${BUILD_VERSION}'
+    tag_name: 'v${BUILD_VERSION}'
+    ref: 'releases'
+    assets:
+      links:
+        - name: 'base-${BUILD_VERSION}.tar.zst'
+          url: '${PACKAGE_REGISTRY_URL}/base-${BUILD_VERSION}.tar.zst'
+        - name: 'base-${BUILD_VERSION}.tar.zst.SHA256'
+          url: '${PACKAGE_REGISTRY_URL}/base-${BUILD_VERSION}.tar.zst.SHA256'
+        - name: 'base-devel-${BUILD_VERSION}.tar.zst'
+          url: '${PACKAGE_REGISTRY_URL}/base-devel-${BUILD_VERSION}.tar.zst'
+        - name: 'base-devel-${BUILD_VERSION}.tar.zst.SHA256'
+          url: '${PACKAGE_REGISTRY_URL}/base-devel-${BUILD_VERSION}.tar.zst.SHA256'
+        - name: 'multilib-devel-${BUILD_VERSION}.tar.zst'
+          url: '${PACKAGE_REGISTRY_URL}/multilib-devel-${BUILD_VERSION}.tar.zst'
+        - name: 'multilib-devel-${BUILD_VERSION}.tar.zst.SHA256'
+          url: '${PACKAGE_REGISTRY_URL}/multilib-devel-${BUILD_VERSION}.tar.zst.SHA256'
+
+# Publish to the official Docker namespace: https://hub.docker.com/_/archlinux
+# Note: The description is maintained here: https://github.com/docker-library/docs/tree/master/archlinux
+publish-dockerhub:
+  stage: publish
+  dependencies:
+    - get_version
+    - pre-release
+  only:
+    refs:
+      - schedules
+    variables:
+      - $PUBLISH_OFFICIAL_LIBRARY == "TRUE"
+  before_script:
+    - export | grep -q BUILD_VERSION=
+    - export | grep -q BUILD_COMMIT=
+    - test -n "$BUILD_VERSION"
+    - test -n "$BUILD_COMMIT"
+    - test -n "$GITHUB_TOKEN"
+    - pacman -Syu --noconfirm github-cli git gettext
+    - git config --global user.email "github@archlinux.org"
+    - git config --global user.name "Arch Linux Technical User"
+  script:
+    - echo "Update the Docker library Github repo"
+    - mkdir official-images
+    - cd official-images
+    - git init
+    - 'git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/archlinux/official-images.git"'
+    - git fetch https://github.com/docker-library/official-images.git
+    - git reset --hard FETCH_HEAD
+    - head="release/${BUILD_VERSION}"
+    - git checkout -b "$head"
+    - cp ../docker-library.template library/archlinux
+    - |
+      for group in base base-devel multilib-devel; do
+        test "${group}" = "base" && extra="latest, " || extra=""
+        echo "Tags: ${extra}${group}, ${group}-${BUILD_VERSION}" >> library/archlinux
+        echo "GitCommit: ${BUILD_COMMIT}" >> library/archlinux
+        echo "GitFetch: refs/tags/v${BUILD_VERSION}" >> library/archlinux
+        echo "File: Dockerfile.${group}" >> library/archlinux
+        echo >> library/archlinux
+      done
+    - git diff
+    - git add library/archlinux
+    - maintainers="$(grep \(@ ../docker-library.template | cut -d\( -f2 | cut -d\) -f1 | xargs)"
+    - test -n "$maintainers"
+    - 'git commit
+        -m "archlinux: Release ${BUILD_VERSION}"
+        -m "This is an automated release [1]."
+        -m "[1] ${CI_PROJECT_URL}/-/blob/master/.gitlab-ci.yml"'
+    - git push -u origin "$head"
+    - 'gh pr create
+        --repo docker-library/official-images
+        --title "$(git show --no-patch --format="%s")"
+        --body "$(printf "%s\n\n---\n\nMaintainers: ${maintainers}\n" "$(git show --no-patch --format="%b")")"
+        --base master
+        --head archlinux:"$head"'
